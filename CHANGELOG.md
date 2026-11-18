@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.2.0
+  * Add opt-in `date_partition_reconciliation` config mode for report streams.
+    The tap stores the full set of `_sdc_record_hash` identities per
+    customer/stream/date after a complete read and emits `_sdc_deleted_at`
+    delete records for identities that disappear on a later read of that date,
+    including dates that return zero rows. Identities are re-baselined when the
+    selected non-metric fields (the row grain) change, and a failed or partial
+    read never updates the index or emits deletes.
+
 ## v2.1.0
   * Upgrade Google Ads API version from v20 to [v24](https://developers.google.com/google-ads/api/fields/v24/overview) [#106](https://github.com/singer-io/tap-google-ads/pull/106)
   * Upgrade `google-ads` SDK from 27.0.0 to 30.1.0

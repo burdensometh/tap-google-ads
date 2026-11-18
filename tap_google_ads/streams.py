@@ -29,6 +29,20 @@ REPORTS_WITH_90_DAY_MAX = frozenset(
 DEFAULT_CONVERSION_WINDOW = 30
 DEFAULT_REQUEST_TIMEOUT = 900 # in seconds
 
+# Field a target with hard-delete support reads to remove the row identified by
+# the record's primary key (`_sdc_record_hash` for report streams).
+DELETED_AT_FIELD = "_sdc_deleted_at"
+
+# Bookmark sub-key holding one entry per date partition, for report streams.
+# Only written after every page for that date has been read successfully.
+DATE_PARTITION_INDEX_KEY = "date_partitions"
+
+# Config flag that turns on date partition reconciliation. Off by default so
+# that existing sync behavior is unchanged.
+DATE_PARTITION_RECONCILIATION_CONFIG = "date_partition_reconciliation"
+
+_TRUE_CONFIG_VALUES = frozenset({"true", "1", "yes", "on"})
+
 
 def get_conversion_window(config):
     """Fetch the conversion window from the config and error on invalid values"""
@@ -79,13 +93,44 @@ def create_nested_resource_schema(resource_schema, fields):
     return new_schema
 
 
+def ensure_deleted_at_in_catalog_entry(catalog_entry):
+    """Make sure the catalog used for a sync declares `_sdc_deleted_at`.
+
+    A catalog discovered before date partition reconciliation was enabled does
+    not contain the column, and the tap writes SCHEMA messages from the catalog
+    in sync mode. Delete records would then fail target schema validation, so
+    the column is added here when missing; re-running discovery persists it in
+    the catalog."""
+    schema = catalog_entry.setdefault("schema", {})
+    properties = schema.setdefault("properties", {})
+    if DELETED_AT_FIELD not in properties:
+        LOGGER.warning(
+            "Catalog for stream %s does not declare %s; adding it for date partition "
+            "reconciliation. Re-run discovery to persist it in the catalog.",
+            catalog_entry.get("tap_stream_id"), DELETED_AT_FIELD
+        )
+        properties[DELETED_AT_FIELD] = {
+            "type": ["null", "string"],
+            "format": "date-time",
+        }
+
+    mdata = singer.metadata.to_map(catalog_entry.get("metadata", []))
+    if ("properties", DELETED_AT_FIELD) not in mdata:
+        singer.metadata.write(mdata, ("properties", DELETED_AT_FIELD), "inclusion", "automatic")
+        singer.metadata.write(mdata, ("properties", DELETED_AT_FIELD), "behavior", "ATTRIBUTE")
+        catalog_entry["metadata"] = singer.metadata.to_list(mdata)
+
+
 def get_selected_fields(stream_mdata):
     selected_fields = set()
     for mdata in stream_mdata:
         if mdata["breadcrumb"]:
             inclusion = mdata["metadata"].get("inclusion")
             selected = mdata["metadata"].get("selected")
-            if utils.should_sync_field(inclusion, selected) and mdata["breadcrumb"][1] != "_sdc_record_hash":
+            if (
+                utils.should_sync_field(inclusion, selected)
+                and mdata["breadcrumb"][1] not in {"_sdc_record_hash", DELETED_AT_FIELD}
+            ):
                 selected_fields.update(mdata["metadata"]["tap-google-ads.api-field-names"])
 
     return selected_fields
@@ -175,6 +220,161 @@ def generate_hash(record, metadata):
     hash_source_data = sorted(fields_to_hash, key=lambda x: x[0])
     hash_bytes = json.dumps(hash_source_data).encode("utf-8")
     return hashlib.sha256(hash_bytes).hexdigest()
+
+
+def is_date_partition_reconciliation_enabled(config):
+    """Return True when the date partition reconciliation mode is turned on.
+
+    The mode is opt-in so that existing connections keep their current state
+    format and sync behavior."""
+    value = config.get(DATE_PARTITION_RECONCILIATION_CONFIG)
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUE_CONFIG_VALUES
+    return False
+
+
+def get_row_identity_definition(stream_mdata):
+    """Return a fingerprint of the fields that make up `_sdc_record_hash`.
+
+    `_sdc_record_hash` is a hash over every non-METRIC field in a record, so
+    the hashes produced by two different field selections are not comparable.
+    The fingerprint lets the sync skip reconciliation for a date partition
+    whose row grain changed instead of deleting rows using stale identities.
+
+    Metric fields are deliberately excluded because `generate_hash` excludes
+    them too: changing only the selected metrics does not change the grain of
+    a row."""
+    selected_fields = get_selected_fields(stream_mdata)
+    metric_fields = set()
+
+    for mdata in stream_mdata:
+        if not mdata["breadcrumb"]:
+            continue
+        if mdata["metadata"].get("behavior") == "METRIC":
+            metric_fields.update(mdata["metadata"].get("tap-google-ads.api-field-names", []))
+
+    identity_fields = selected_fields - metric_fields
+
+    # Version the payload so that a future change to `generate_hash` can be
+    # told apart from the current identities.
+    payload = "\n".join(["v1"] + sorted(identity_fields))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_date_partition_index(bookmark_object):
+    """Return the per-date identity index stored in a report stream bookmark."""
+    index = bookmark_object.get(DATE_PARTITION_INDEX_KEY, {})
+    if isinstance(index, dict):
+        return index
+    return {}
+
+
+def get_partition_identities(partition):
+    """Return the hashes stored for one date partition, or None.
+
+    A partition is only usable for comparison when it has the expected,
+    well-formed shape. Anything else is treated as if we have never completed
+    that date so that no deletes are emitted from data we cannot trust."""
+    if not isinstance(partition, dict):
+        return None
+
+    identities = partition.get("record_hashes")
+    if not isinstance(identities, list):
+        return None
+    if not all(isinstance(identity, str) for identity in identities):
+        return None
+    return identities
+
+
+def emit_date_partition_deletes(stream_name, partition_date, missing_identities):
+    """Write RECORD messages a delete-aware target can use to remove old rows.
+
+    Report streams use `_sdc_record_hash` as their primary key, so a record
+    carrying that key plus `_sdc_deleted_at` identifies exactly the rows that
+    are no longer present in the source. These are real Singer RECORD messages
+    (not log lines), which is what lets targets that support hard deletes act
+    on them."""
+    deleted_at = utils.strftime(utils.now())
+
+    for identity in missing_identities:
+        LOGGER.info(
+            "Deleting %s record from date partition %s of stream %s.",
+            identity, partition_date, stream_name
+        )
+        singer.write_record(stream_name, {
+            "_sdc_record_hash": identity,
+            "date": utils.strftime(utils.strptime_to_utc(partition_date)),
+            DELETED_AT_FIELD: deleted_at,
+        })
+
+
+def get_date_partition_retention_floor(last_completed_date, steady_state_floor):
+    """Earliest partition date that some later read can still compare against.
+
+    A later read starts at `min(bookmark, max(start_date, conversion_window))`
+    and the bookmark only moves forward. While a run is still behind
+    `steady_state_floor` (= `max(start_date, conversion_window)`), the bookmark
+    is the last completed date, so a resume re-reads exactly that date and
+    nothing earlier. Once the run has passed the floor, no later read can ask
+    for a date before it. The floor is therefore the smaller of the two."""
+    return min(last_completed_date, steady_state_floor)
+
+
+def prune_date_partition_index(partition_index, retention_floor_date):
+    """Drop index entries for dates no later read can ever query again."""
+    floor = utils.strftime(retention_floor_date, format_str="%Y-%m-%d")
+    return {
+        partition_date: partition
+        for partition_date, partition in partition_index.items()
+        if partition_date >= floor
+    }
+
+
+def reconcile_date_partition(stream_name, partition_date, identity_definition,
+                             partition_index, current_identities):
+    """Compare one completed date partition against its last complete snapshot.
+
+    `current_identities` must only contain the identities of a partition whose
+    every page was read successfully. A missing identity is a row that vanished
+    from the source (or, for a zero-row day, every previously seen row), so a
+    delete record is emitted for it before the partition index is refreshed.
+
+    Returns the updated index; the caller owns writing it to state."""
+    previous_partition = partition_index.get(partition_date)
+    previous_identities = get_partition_identities(previous_partition)
+
+    if previous_identities is None:
+        # Either the first completed read of this date, or a snapshot we cannot
+        # trust. Baseline the partition instead of guessing at deletions.
+        LOGGER.info(
+            "Recording baseline for date partition %s of stream %s.",
+            partition_date, stream_name
+        )
+    elif previous_partition.get("identity_definition") != identity_definition:
+        # The fields feeding `_sdc_record_hash` changed, so old and new hashes
+        # describe different row grains and cannot be compared. Re-baseline
+        # rather than delete rows using identities from the old grain.
+        LOGGER.warning(
+            "Row grain changed for date partition %s of stream %s; "
+            "skipping deletions and re-baselining the partition.",
+            partition_date, stream_name
+        )
+    else:
+        missing_identities = sorted(set(previous_identities) - current_identities)
+        if missing_identities:
+            emit_date_partition_deletes(stream_name, partition_date, missing_identities)
+
+    updated_index = dict(partition_index)
+    updated_index[partition_date] = {
+        "identity_definition": identity_definition,
+        "record_hashes": sorted(current_identities),
+    }
+    return updated_index
 
 
 class TimeoutException(Exception):
@@ -584,6 +784,13 @@ class UserInterestStream(BaseStream):
 
 class ReportStream(BaseStream):
 
+    def __init__(self, fields, google_ads_resource_names, resource_schema, primary_keys, automatic_keys = None, filter_param = None, include_deleted_at = False):
+        # Report streams declare the hard-delete marker only when date partition
+        # reconciliation is enabled so default discovery output is unchanged.
+        self.include_deleted_at = include_deleted_at
+        super().__init__(fields, google_ads_resource_names, resource_schema,
+                         primary_keys, automatic_keys, filter_param)
+
     def create_full_schema(self, resource_schema):
         google_ads_name = self.google_ads_resource_names[0]
         self.resource_object = resource_schema[google_ads_name]
@@ -598,6 +805,11 @@ class ReportStream(BaseStream):
                 "_sdc_record_hash": {"type": "string"}
             },
         }
+        if self.include_deleted_at:
+            self.stream_schema["properties"][DELETED_AT_FIELD] = {
+                "type": ["null", "string"],
+                "format": "date-time",
+            }
 
     def format_field_names(self):
         """This function does two things right now:
@@ -628,6 +840,13 @@ class ReportStream(BaseStream):
                 "behavior": "PRIMARY KEY"
             },
         }
+        if self.include_deleted_at:
+            # Written as a real column so delete-aware targets can act on the
+            # delete RECORD messages emitted by date partition reconciliation.
+            self.stream_metadata[("properties", DELETED_AT_FIELD)] = {
+                "inclusion": "automatic",
+                "behavior": "ATTRIBUTE",
+            }
         for report_field in self.fields:
             # Transform the field name to match the schema
             is_metric_or_segment = report_field.startswith("metrics.") or report_field.startswith("segments.")
@@ -705,6 +924,13 @@ class ReportStream(BaseStream):
         state = singer.set_currently_syncing(state, [stream_name, customer["customerId"]])
         singer.write_state(state)
 
+        reconciliation_enabled = is_date_partition_reconciliation_enabled(config)
+        # The set of non-metric fields feeding `_sdc_record_hash` decides
+        # whether identities from a previous run are comparable at all.
+        identity_definition = (
+            get_row_identity_definition(stream_mdata) if reconciliation_enabled else None
+        )
+
         conversion_window = timedelta(
             days=get_conversion_window(config)
         )
@@ -735,6 +961,21 @@ class ReportStream(BaseStream):
         if selected_fields == {'segments.date'}:
             raise Exception(f"Selected fields is currently limited to {', '.join(selected_fields)}. Please select at least one attribute and metric in order to replicate {stream_name}.")
 
+        # A later read starts at `min(bookmark, max(start_date,
+        # conversion_window))`, and the bookmark only moves forward. Once this
+        # run reaches this date, no later read can ask for anything earlier.
+        steady_state_floor = max(
+            utils.strptime_to_utc(config["start_date"]),
+            conversion_window_date,
+        )
+
+        partition_index = {}
+        if reconciliation_enabled:
+            partition_index = prune_date_partition_index(
+                get_date_partition_index(bookmark_object),
+                get_date_partition_retention_floor(query_date, steady_state_floor),
+            )
+
         while query_date <= end_date:
             query = create_report_query(resource_name, selected_fields, query_date)
             LOGGER.info(f"Requesting {stream_name} data for {utils.strftime(query_date, '%Y-%m-%d')}.")
@@ -746,6 +987,10 @@ class ReportStream(BaseStream):
                 LOGGER.critical(str(err.failure.errors[0].message))
                 raise RuntimeError from None
 
+            partition_date = utils.strftime(query_date, format_str="%Y-%m-%d")
+            # Identities are collected per date and are only compared against
+            # the previous snapshot once every page of the date was consumed.
+            day_identities = set()
 
             with Transformer() as transformer:
                 # Pages are fetched automatically while iterating through the response
@@ -757,7 +1002,35 @@ class ReportStream(BaseStream):
 
                     singer.write_record(stream_name, record)
 
-            new_bookmark_value = {replication_key: utils.strftime(query_date)}
+                    if reconciliation_enabled:
+                        day_identities.add(record["_sdc_record_hash"])
+
+            if reconciliation_enabled:
+                # The whole date was read without raising, so it is a complete
+                # read. Missing identities (including a day that now returns
+                # zero rows) produce delete records before the index is updated.
+                partition_index = reconcile_date_partition(
+                    stream_name,
+                    partition_date,
+                    identity_definition,
+                    partition_index,
+                    day_identities,
+                )
+                # Prune as the run advances so a historical backfill does not
+                # accumulate one identity set per date in state. Keeping the
+                # current date lets a resume compare it, since a resume starts
+                # at the bookmarked date.
+                partition_index = prune_date_partition_index(
+                    partition_index,
+                    get_date_partition_retention_floor(query_date, steady_state_floor),
+                )
+                new_bookmark_value = {
+                    replication_key: utils.strftime(query_date),
+                    DATE_PARTITION_INDEX_KEY: partition_index,
+                }
+            else:
+                new_bookmark_value = {replication_key: utils.strftime(query_date)}
+
             singer.write_bookmark(state, stream["tap_stream_id"], customer["customerId"], new_bookmark_value)
 
             singer.write_state(state)
@@ -945,16 +1218,19 @@ def initialize_core_streams(resource_schema):
     }
 
 
-def initialize_reports(resource_schema):
+def initialize_reports(resource_schema, include_deleted_at=False):
+    def make_report_stream(*args, **kwargs):
+        return ReportStream(*args, include_deleted_at=include_deleted_at, **kwargs)
+
     return {
-        "account_performance_report": ReportStream(
+        "account_performance_report": make_report_stream(
             report_definitions.ACCOUNT_PERFORMANCE_REPORT_FIELDS,
             ["customer"],
             resource_schema,
             ["_sdc_record_hash"],
             {"customer_id"},
         ),
-        "ad_group_audience_performance_report": ReportStream(
+        "ad_group_audience_performance_report": make_report_stream(
             report_definitions.AD_GROUP_AUDIENCE_PERFORMANCE_REPORT_FIELDS,
             ["ad_group_audience_view"],
             resource_schema,
@@ -964,21 +1240,21 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
              },
         ),
-        "ad_group_performance_report": ReportStream(
+        "ad_group_performance_report": make_report_stream(
             report_definitions.AD_GROUP_PERFORMANCE_REPORT_FIELDS,
             ["ad_group"],
             resource_schema,
             ["_sdc_record_hash"],
             {"ad_group_id"},
         ),
-        "ad_performance_report": ReportStream(
+        "ad_performance_report": make_report_stream(
             report_definitions.AD_PERFORMANCE_REPORT_FIELDS,
             ["ad_group_ad"],
             resource_schema,
             ["_sdc_record_hash"],
             {"id"},
         ),
-        "age_range_performance_report": ReportStream(
+        "age_range_performance_report": make_report_stream(
             report_definitions.AGE_RANGE_PERFORMANCE_REPORT_FIELDS,
             ["age_range_view"],
             resource_schema,
@@ -989,14 +1265,14 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
              },
         ),
-        "campaign_performance_report": ReportStream(
+        "campaign_performance_report": make_report_stream(
             report_definitions.CAMPAIGN_PERFORMANCE_REPORT_FIELDS,
             ["campaign"],
             resource_schema,
             ["_sdc_record_hash"],
             {"campaign_id"},
         ),
-        "campaign_audience_performance_report": ReportStream(
+        "campaign_audience_performance_report": make_report_stream(
             report_definitions.CAMPAIGN_AUDIENCE_PERFORMANCE_REPORT_FIELDS,
             ["campaign_audience_view"],
             resource_schema,
@@ -1006,7 +1282,7 @@ def initialize_reports(resource_schema):
                 "campaign_criterion_criterion_id",
             },
         ),
-        "click_performance_report": ReportStream(
+        "click_performance_report": make_report_stream(
             report_definitions.CLICK_PERFORMANCE_REPORT_FIELDS,
             ["click_view"],
             resource_schema,
@@ -1016,7 +1292,7 @@ def initialize_reports(resource_schema):
                 "click_view_gclid",
             },
         ),
-        "display_keyword_performance_report": ReportStream(
+        "display_keyword_performance_report": make_report_stream(
             report_definitions.DISPLAY_KEYWORD_PERFORMANCE_REPORT_FIELDS,
             ["display_keyword_view"],
             resource_schema,
@@ -1026,7 +1302,7 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
             },
         ),
-        "display_topics_performance_report": ReportStream(
+        "display_topics_performance_report": make_report_stream(
             report_definitions.DISPLAY_TOPICS_PERFORMANCE_REPORT_FIELDS,
             ["topic_view"],
             resource_schema,
@@ -1036,14 +1312,14 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
             },
         ),
-        "expanded_landing_page_report": ReportStream(
+        "expanded_landing_page_report": make_report_stream(
             report_definitions.EXPANDED_LANDING_PAGE_REPORT_FIELDS,
             ["expanded_landing_page_view"],
             resource_schema,
             ["_sdc_record_hash"],
             {"expanded_landing_page_view_expanded_final_url"},
         ),
-        "gender_performance_report": ReportStream(
+        "gender_performance_report": make_report_stream(
             report_definitions.GENDER_PERFORMANCE_REPORT_FIELDS,
             ["gender_view"],
             resource_schema,
@@ -1053,7 +1329,7 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
             },
         ),
-        "geo_performance_report": ReportStream(
+        "geo_performance_report": make_report_stream(
             report_definitions.GEO_PERFORMANCE_REPORT_FIELDS,
             ["geographic_view"],
             resource_schema,
@@ -1063,7 +1339,7 @@ def initialize_reports(resource_schema):
                 "geographic_view_location_type",
             },
         ),
-        "keywordless_query_report": ReportStream(
+        "keywordless_query_report": make_report_stream(
             report_definitions.KEYWORDLESS_QUERY_REPORT_FIELDS,
             ["dynamic_search_ads_search_term_view"],
             resource_schema,
@@ -1076,7 +1352,7 @@ def initialize_reports(resource_schema):
                 "dynamic_search_ads_search_term_view_search_term",
             },
         ),
-        "keywords_performance_report": ReportStream(
+        "keywords_performance_report": make_report_stream(
             report_definitions.KEYWORDS_PERFORMANCE_REPORT_FIELDS,
             ["keyword_view"],
             resource_schema,
@@ -1086,14 +1362,14 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
             },
         ),
-        "landing_page_report": ReportStream(
+        "landing_page_report": make_report_stream(
             report_definitions.LANDING_PAGE_REPORT_FIELDS,
             ["landing_page_view"],
             resource_schema,
             ["_sdc_record_hash"],
             {"landing_page_view_unexpanded_final_url"},
         ),
-        "placement_performance_report": ReportStream(
+        "placement_performance_report": make_report_stream(
             report_definitions.PLACEMENT_PERFORMANCE_REPORT_FIELDS,
             ["managed_placement_view"],
             resource_schema,
@@ -1103,7 +1379,7 @@ def initialize_reports(resource_schema):
                 "ad_group_id",
             },
         ),
-        "search_query_performance_report": ReportStream(
+        "search_query_performance_report": make_report_stream(
             report_definitions.SEARCH_QUERY_PERFORMANCE_REPORT_FIELDS,
             ["search_term_view"],
             resource_schema,
@@ -1114,13 +1390,13 @@ def initialize_reports(resource_schema):
                 "search_term_view_search_term",
             },
         ),
-        "shopping_performance_report": ReportStream(
+        "shopping_performance_report": make_report_stream(
             report_definitions.SHOPPING_PERFORMANCE_REPORT_FIELDS,
             ["shopping_performance_view"],
             resource_schema,
             ["_sdc_record_hash"],
         ),
-        "user_location_performance_report": ReportStream(
+        "user_location_performance_report": make_report_stream(
             report_definitions.USER_LOCATION_PERFORMANCE_REPORT_FIELDS,
             ["user_location_view"],
             resource_schema,
@@ -1130,7 +1406,7 @@ def initialize_reports(resource_schema):
                 "user_location_view_targeting_location",
             },
         ),
-        "video_performance_report": ReportStream(
+        "video_performance_report": make_report_stream(
             report_definitions.VIDEO_PERFORMANCE_REPORT_FIELDS,
             ["video"],
             resource_schema,

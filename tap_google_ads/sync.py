@@ -1,7 +1,12 @@
 import json
 import singer
 from tap_google_ads.client import create_sdk_client
-from tap_google_ads.streams import initialize_core_streams, initialize_reports
+from tap_google_ads.streams import (
+    ensure_deleted_at_in_catalog_entry,
+    initialize_core_streams,
+    initialize_reports,
+    is_date_partition_reconciliation_enabled,
+)
 
 LOGGER = singer.get_logger()
 DEFAULT_QUERY_LIMIT = 1000000
@@ -90,7 +95,8 @@ def do_sync(config, catalog, resource_schema, state):
     selected_streams = sort_selected_streams(selected_streams)
 
     core_streams = initialize_core_streams(resource_schema)
-    report_streams = initialize_reports(resource_schema)
+    include_deleted_at = is_date_partition_reconciliation_enabled(config)
+    report_streams = initialize_reports(resource_schema, include_deleted_at=include_deleted_at)
     resuming_stream, resuming_customer = get_currently_syncing(state)
 
     if resuming_stream:
@@ -111,6 +117,13 @@ def do_sync(config, catalog, resource_schema, state):
 
     for catalog_entry in selected_streams:
         stream_name = catalog_entry["stream"]
+        is_report_stream = stream_name in report_streams
+
+        if is_report_stream and include_deleted_at:
+            # Sync writes its SCHEMA message from this catalog entry, so the
+            # delete column has to be present before any delete record is sent.
+            ensure_deleted_at_in_catalog_entry(catalog_entry)
+
         mdata_map = singer.metadata.to_map(catalog_entry["metadata"])
 
         primary_key = mdata_map[()].get("table-key-properties", [])

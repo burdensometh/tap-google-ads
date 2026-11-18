@@ -50,6 +50,39 @@ This tap:
 
 The Google Ads API supports the `start_date` and `end_date` parameters that limits the records which filters the analytics records in the given time period.
 
+### Date partition reconciliation
+
+Report streams bookmark one date at a time and re-read the conversion window on
+every run, so a date can be read many times. If a segmented row disappears
+entirely from Google Ads, no new row is produced for it, and a target that keys
+on `_sdc_record_hash` keeps the old metrics forever.
+
+Set `date_partition_reconciliation` to `true` in the config to reconcile each
+date partition instead of only appending rows:
+
+ - The tap keeps, per stream/customer/date, the full set of `_sdc_record_hash`
+   identities from the last **complete** read of that date.
+ - After every page of a date has been read successfully, any previously seen
+   identity that is missing from this read is emitted as a delete record: a
+   RECORD carrying only `_sdc_record_hash`, `date` and `_sdc_deleted_at`. A date
+   that now returns zero rows therefore deletes every row previously seen for
+   it.
+ - The date's identity index is only updated after that successful read. A
+   failed or retried request never treats a partially read date as complete, so
+   an interrupted day cannot delete rows.
+ - Identities are only compared when the fields that feed `_sdc_record_hash`
+   (the selected non-metric fields) are unchanged. When the row grain changes,
+   the tap re-baselines that date instead of deleting rows with hashes from the
+   old grain.
+ - `_sdc_deleted_at` is declared in the discovered schema and metadata, so
+   targets that support hard deletes remove the old row. Targets that do not
+   support deletes still receive normal RECORD messages.
+
+The mode is off by default and leaves bookmark/state shape unchanged when
+disabled. Enabling it for an existing connection requires a re-discovery so the
+catalog contains `_sdc_deleted_at`; if the catalog does not, the tap adds the
+column to the schema it emits and logs a warning.
+
 ## Configuration
 
 This tap requires a `config.json` which specifies details regarding [OAuth 2.0](https://developers.google.com/google-ads/api/docs/oauth/overview) authentication and a cutoff date for syncing historical data. See [config.sample.json](config.sample.json) for an example.
