@@ -11,6 +11,7 @@ from google.api_core.exceptions import ServerError, TooManyRequests
 from requests.exceptions import ReadTimeout
 import backoff
 from . import report_definitions
+from . import collection_definition
 
 LOGGER = singer.get_logger()
 
@@ -28,6 +29,31 @@ REPORTS_WITH_90_DAY_MAX = frozenset(
 
 DEFAULT_CONVERSION_WINDOW = 30
 DEFAULT_REQUEST_TIMEOUT = 900 # in seconds
+DEFAULT_DEFINITION_BACKFILL_DAYS = 30
+
+
+def get_definition_backfill_days(config):
+    """Days to re-read when an additive definition change needs backfill."""
+    value = config.get("definition_backfill_days")
+    if value is None or value == "":
+        return DEFAULT_DEFINITION_BACKFILL_DAYS
+
+    try:
+        value = int(value)
+    except (ValueError, TypeError):
+        LOGGER.warning(
+            "The provided definition_backfill_days is invalid; using the default of %s.",
+            DEFAULT_DEFINITION_BACKFILL_DAYS,
+        )
+        return DEFAULT_DEFINITION_BACKFILL_DAYS
+
+    if value < 0:
+        LOGGER.warning(
+            "The provided definition_backfill_days is negative; using the default of %s.",
+            DEFAULT_DEFINITION_BACKFILL_DAYS,
+        )
+        return DEFAULT_DEFINITION_BACKFILL_DAYS
+    return value
 
 
 def get_conversion_window(config):
@@ -165,7 +191,7 @@ def create_report_query(resource_name, selected_fields, query_date):
     return report_query
 
 
-def generate_hash(record, metadata):
+def generate_hash(record, metadata, identity_scope=None):
     metadata = singer.metadata.to_map(metadata)
     fields_to_hash = []
     for key, val in record.items():
@@ -173,6 +199,10 @@ def generate_hash(record, metadata):
             fields_to_hash.append((key, val))
 
     hash_source_data = sorted(fields_to_hash, key=lambda x: x[0])
+    if identity_scope:
+        # A new extraction generation must not reuse the previous generation's
+        # record identities.
+        hash_source_data.append(("__identity_scope__", identity_scope))
     hash_bytes = json.dumps(hash_source_data).encode("utf-8")
     return hashlib.sha256(hash_bytes).hexdigest()
 
@@ -428,6 +458,13 @@ class BaseStream:  # pylint: disable=too-many-instance-attributes
         stream_mdata = stream["metadata"]
         selected_fields = get_selected_fields(stream_mdata)
         state = singer.set_currently_syncing(state, [stream_name, customer["customerId"]])
+        singer.write_state(state)
+
+        # Resolve the collection definition before reading bookmarks so an
+        # incompatible definition can archive the cursor instead of silently
+        # resuming from it.  Core streams are FULL_TABLE and journal progress
+        # by primary key, so the returned strategy is informational here.
+        collection_definition.resolve_collection_definition(state, stream, self)
         singer.write_state(state)
 
         # last run was interrupted if there is a bookmark available for core streams.
@@ -705,6 +742,13 @@ class ReportStream(BaseStream):
         state = singer.set_currently_syncing(state, [stream_name, customer["customerId"]])
         singer.write_state(state)
 
+        # Resolve the collection definition before reading bookmarks.  A
+        # segment/identity change must not silently reuse the old cursor.
+        definition = collection_definition.resolve_collection_definition(
+            state, stream, self
+        )
+        singer.write_state(state)
+
         conversion_window = timedelta(
             days=get_conversion_window(config)
         )
@@ -719,6 +763,56 @@ class ReportStream(BaseStream):
             bookmark=bookmark_value,
             conversion_window_date=singer.utils.strftime(conversion_window_date)
         )
+
+        # A customer that already produced rows under the current definition
+        # keeps its progress; one still holding a bookmark written under the
+        # previous definition must not silently resume from it.
+        definition_matches_bookmark = (
+            collection_definition.customer_has_current_definition(
+                state, stream["tap_stream_id"], customer["customerId"], definition
+            )
+            or not bookmark_value
+        )
+        strategy = definition["strategy"]
+        should_rewind = (
+            strategy in (
+                collection_definition.STRATEGY_LIMITED_BACKFILL,
+                collection_definition.STRATEGY_NEW_GENERATION,
+            )
+            and not definition_matches_bookmark
+        )
+
+        if should_rewind:
+            if strategy == collection_definition.STRATEGY_LIMITED_BACKFILL:
+                # Newly selected columns do not exist in rows replicated before
+                # the bookmark.  Re-read a bounded window rather than clearing
+                # progress for every customer; earlier history is preserved.
+                backfill_days = get_definition_backfill_days(config)
+                backfill_start = max(
+                    singer.utils.strptime_to_utc(config["start_date"]),
+                    singer.utils.strptime_to_utc(bookmark_value) - timedelta(days=backfill_days),
+                )
+                LOGGER.warning(
+                    "Collection definition changed for %s (customer %s); "
+                    "re-reading %s day(s) from %s.",
+                    stream_name,
+                    customer["customerId"],
+                    backfill_days,
+                    utils.strftime(backfill_start, "%Y-%m-%d"),
+                )
+            else:
+                # A new generation never reuses the archived generation's
+                # bookmark, so it starts from start_date.
+                backfill_start = singer.utils.strptime_to_utc(config["start_date"])
+                LOGGER.warning(
+                    "Not resuming %s for customer %s: its bookmark was written "
+                    "under an incompatible collection definition.",
+                    stream_name,
+                    customer["customerId"],
+                )
+
+            if backfill_start < query_date:
+                query_date = backfill_start
 
         end_date = config.get("end_date")
         if end_date:
@@ -753,12 +847,17 @@ class ReportStream(BaseStream):
                     json_message = google_message_to_json(message)
                     transformed_message = self.transform_keys(json_message)
                     record = transformer.transform(transformed_message, stream["schema"])
-                    record["_sdc_record_hash"] = generate_hash(record, stream_mdata)
+                    record["_sdc_record_hash"] = generate_hash(
+                        record, stream_mdata, definition.get("identity_scope")
+                    )
 
                     singer.write_record(stream_name, record)
 
             new_bookmark_value = {replication_key: utils.strftime(query_date)}
             singer.write_bookmark(state, stream["tap_stream_id"], customer["customerId"], new_bookmark_value)
+            collection_definition.mark_customer_definition(
+                state, stream["tap_stream_id"], customer["customerId"], definition
+            )
 
             singer.write_state(state)
 

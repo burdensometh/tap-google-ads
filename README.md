@@ -50,6 +50,53 @@ This tap:
 
 The Google Ads API supports the `start_date` and `end_date` parameters that limits the records which filters the analytics records in the given time period.
 
+### Collection-definition fingerprints
+
+Changing the selected fields, field aliases, or resource mapping can change what a bookmark means.  Without a guard, a bookmark written under an old selection would silently skip the data the new selection has not yet collected.  Each stream therefore stores a fingerprint of its *collection definition* in `state["collection_definitions"][<stream>]`:
+
+```json
+{
+  "collection_definitions": {
+    "campaign_performance_report": {
+      "fingerprint": "…",
+      "identity_fingerprint": "…",
+      "components": {
+        "stream_kind": "report",
+        "resource_names": ["campaign"],
+        "primary_keys": ["_sdc_record_hash"],
+        "segments": ["segments.date", "segments.device"],
+        "attributes": ["campaign.id"],
+        "metrics": ["metrics.clicks"],
+        "aliases": {"campaign_id": ["campaign.id"]},
+        "identity_fields": ["campaign_id", "date", "device"]
+      },
+      "category": "ADDITIVE",
+      "strategy": "limited_backfill",
+      "generation": 1,
+      "pending_transition": { "…": "…" }
+    }
+  }
+}
+```
+
+Every transition is classified and mapped to an explicit strategy:
+
+| Classification | Meaning | Strategy |
+| --- | --- | --- |
+| `UNCHANGED` | Definition is identical | `continue` |
+| `LEGACY` | No fingerprint stored yet (upgrading the tap) | `continue` — the fingerprint is adopted and progress is preserved |
+| `METRIC_ONLY` | Only metrics were added/removed | `continue` — metrics never affect grain or record identity |
+| `ADDITIVE` | Non-segment attribute columns were added | `limited_backfill` — re-read `definition_backfill_days` (default 30) before the bookmark |
+| `SEGMENT_CHANGE` | The selected segments changed (the grain changed) | `new_generation` |
+| `IDENTITY_CHANGE` | Aliases, resource mapping, primary keys, or report attributes changed | `new_generation` |
+| `COLUMNS_CHANGED` | Core-stream attributes were removed (primary-key cursor is unaffected) | `continue` |
+
+A `new_generation` never silently reuses an incompatible bookmark: the stream's active bookmarks are archived (not deleted) under `collection_definitions.<stream>.history`, the query restarts at `start_date`, and `identity_scope` is folded into `_sdc_record_hash` so the new generation's rows are distinguishable from the old generation's rows.
+
+The decision is latched in `pending_transition` for the entire customer loop and cleared only when the stream completes, so an interrupted sync applies the same strategy to customers it has not reached yet.  Per-customer progress is tracked in `collection_definitions.<stream>.customer_definitions`, so a customer that already restarted into the new generation keeps its progress when the sync resumes, while a customer still on the old bookmark is rewound.  Core (FULL_TABLE) streams are unaffected by column changes for their primary-key cursor and therefore always continue.
+
+`definition_backfill_days` can be set in the config to control the bounded re-read window.
+
 ## Configuration
 
 This tap requires a `config.json` which specifies details regarding [OAuth 2.0](https://developers.google.com/google-ads/api/docs/oauth/overview) authentication and a cutoff date for syncing historical data. See [config.sample.json](config.sample.json) for an example.

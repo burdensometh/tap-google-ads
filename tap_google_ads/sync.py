@@ -1,5 +1,6 @@
 import json
 import singer
+from tap_google_ads import collection_definition
 from tap_google_ads.client import create_sdk_client
 from tap_google_ads.streams import initialize_core_streams, initialize_reports
 
@@ -127,6 +128,13 @@ def do_sync(config, catalog, resource_schema, state):
                 stream_obj = report_streams[stream_name]
 
             stream_obj.sync(sdk_client, customer, catalog_entry, config, state, query_limit=query_limit)
+
+        # The latching traversal applies the same strategy to every customer;
+        # only now is the transition actually complete.
+        if collection_definition.complete_stream_transition(
+            state, catalog_entry["tap_stream_id"]
+        ):
+            singer.write_state(state)
 
     state.pop("currently_syncing", None)
     singer.write_state(state)

@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+  * Persist a collection-definition fingerprint per stream in state and classify definition changes (additive columns, segment/grain changes, alias/resource-mapping changes, metric-only changes) into explicit `continue`, `limited_backfill`, and `new_generation` strategies.  Incompatible bookmarks are archived under `collection_definitions.<stream>.history` instead of being silently reused, and `identity_scope` is folded into `_sdc_record_hash` for a new generation.  Adds the optional `definition_backfill_days` config.
+
 ## v2.1.0
   * Upgrade Google Ads API version from v20 to [v24](https://developers.google.com/google-ads/api/fields/v24/overview) [#106](https://github.com/singer-io/tap-google-ads/pull/106)
   * Upgrade `google-ads` SDK from 27.0.0 to 30.1.0
